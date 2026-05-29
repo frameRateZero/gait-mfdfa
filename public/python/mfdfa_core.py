@@ -1,28 +1,34 @@
 """
-mfdfa_core.py
-=============
-compute_multifractal_spectrum(), run_channel_mfdfa(),
-spectrum_scalars(), surrogate_iaaft(), surrogate_shuffle(), DEFAULT_Q
-
-Ported from confirmed-working Colab notebook.
-Pyodide constraints: no joblib — surrogates are sequential.
+mfdfa_core.py  —  defensive-copy edition
+=========================================
+All numpy arrays are copied on entry and on return.
+No shared mutable state between calls.
 """
 
 import numpy as np
-from MFDFA import MFDFA
+from MFDFA import MFDFA as _MFDFA_fn
 
-# ── Default q range (no q=0) ──────────────────────────────────────────────────
+# ── Default q range (no q=0) — immutable reference ───────────────────────────
 DEFAULT_Q = np.concatenate([
-    np.linspace(-5.0, -0.5, 15),   # negative q: large fluctuations
-    np.linspace( 0.5,  5.0, 15),   # positive q: small fluctuations
+    np.linspace(-5.0, -0.5, 15),
+    np.linspace( 0.5,  5.0, 15),
 ])
+DEFAULT_Q.flags.writeable = False   # make it read-only so mutations raise immediately
+
+
+def _fresh_q(q=None):
+    """Always return a fresh, writeable float64 copy of q."""
+    if q is None:
+        return DEFAULT_Q.astype(np.float64)          # .astype always copies
+    return np.array(q, dtype=np.float64, copy=True)  # explicit copy
+
 
 # ── Surrogates ────────────────────────────────────────────────────────────────
 
 def surrogate_shuffle(signal, rng=None):
     if rng is None:
         rng = np.random.default_rng()
-    s = np.asarray(signal, dtype=np.float64).copy()
+    s = np.array(signal, dtype=np.float64, copy=True)
     rng.shuffle(s)
     return s
 
@@ -31,7 +37,7 @@ def surrogate_iaaft(signal, n_iter=100, rng=None):
     """IAAFT surrogate — sequential, safe for Pyodide."""
     if rng is None:
         rng = np.random.default_rng()
-    x        = np.asarray(signal, dtype=np.float64)
+    x        = np.array(signal, dtype=np.float64, copy=True)
     n        = len(x)
     x_sorted = np.sort(x)
     X_amp    = np.abs(np.fft.rfft(x))
@@ -42,193 +48,199 @@ def surrogate_iaaft(signal, n_iter=100, rng=None):
         S_new  = X_amp * np.exp(1j * phases)
         s      = np.fft.irfft(S_new, n=n)
         ranks  = np.argsort(np.argsort(s))
-        s      = x_sorted[ranks]
-    return s.astype(np.float64)
+        s      = x_sorted[ranks].copy()   # copy so x_sorted is never mutated
+    return s.astype(np.float64, copy=True)
 
 
 # ── Core computation ──────────────────────────────────────────────────────────
 
 def compute_multifractal_spectrum(
     signal,
-    fs              = 50.0,
-    order           = 2,
-    q               = None,
-    n_lags          = 80,
-    scale_min_s     = 0.3,
-    scale_max_s     = 30.0,
-    surrogate_results = None,
-    min_lags        = 16,
+    fs            = 50.0,
+    order         = 2,
+    q             = None,
+    n_lags        = 80,
+    scale_min_s   = 0.3,
+    scale_max_s   = 30.0,
+    min_lags      = 16,
 ):
-    signal = np.asarray(signal, dtype=np.float64)
-    n      = len(signal)
+    """
+    Compute multifractal spectrum for a single signal.
+    All inputs copied; returned dict contains only fresh arrays — no aliasing.
+    """
+    # ── defensive copies on entry ─────────────────────────────────────────
+    sig = np.array(signal, dtype=np.float64, copy=True)
+    q   = _fresh_q(q)
+    n   = len(sig)
 
-    if q is None:
-        q = DEFAULT_Q.copy()
-    q = np.asarray(q, dtype=np.float64)
-
+    # ── lag range ─────────────────────────────────────────────────────────
     max_lag   = n // 4
-    lag_range = np.unique(np.logspace(1, np.log10(max_lag), n_lags).astype(int))
+    lag_range = np.unique(
+        np.logspace(1, np.log10(max_lag), n_lags).astype(int)
+    )
     if len(lag_range) < min_lags:
         raise ValueError(
             f"Signal too short: only {len(lag_range)} distinct lags "
             f"(need ≥{min_lags}). n={n}, max_lag={max_lag}."
         )
 
-    lag, Fqs = MFDFA(signal, lag=lag_range, q=q, order=order)
-    lag   = lag.flatten().astype(int)
-    lag_s = lag / fs
+    # ── MFDFA call — pass copies so the package cannot mutate our arrays ──
+    lag, Fqs = _MFDFA_fn(
+        sig.copy(), lag=lag_range.copy(), q=q.copy(), order=order
+    )
+    lag   = lag.flatten().astype(int).copy()
+    Fqs   = np.array(Fqs, dtype=np.float64, copy=True)
+    lag_s = lag / float(fs)
 
-    lo = scale_min_s if scale_min_s is not None else float(lag_s.min())
-    hi = scale_max_s if scale_max_s is not None else float(lag_s.max())
+    # ── scale window ──────────────────────────────────────────────────────
+    lo = float(scale_min_s) if scale_min_s is not None else float(lag_s.min())
+    hi = float(scale_max_s) if scale_max_s is not None else float(lag_s.max())
     scale_mask = (lag_s >= lo) & (lag_s <= hi)
 
     if scale_mask.sum() < 4:
         raise ValueError(
-            f"Fewer than 4 lag points in [{lo:.2f}, {hi:.2f}] s."
+            f"Fewer than 4 lag points in [{lo:.2f}, {hi:.2f}] s. "
+            f"lag_s range: [{lag_s.min():.2f}, {lag_s.max():.2f}]"
         )
 
-    log_lag_fit = np.log2(lag_s[scale_mask])
+    log_lag_fit = np.log2(lag_s[scale_mask].copy())
 
-    H_q = np.empty(len(q))
+    # ── H(q): slope of log F(q,s) vs log s ───────────────────────────────
+    H_q = np.full(len(q), np.nan, dtype=np.float64)
     for i in range(len(q)):
-        log_F  = np.log2(Fqs[scale_mask, i])
+        log_F  = np.log2(Fqs[scale_mask, i].copy())
         finite = np.isfinite(log_F)
         if finite.sum() >= 4:
-            H_q[i] = float(np.polyfit(log_lag_fit[finite], log_F[finite], 1)[0])
-        else:
-            H_q[i] = np.nan
+            coeffs = np.polyfit(log_lag_fit[finite], log_F[finite], 1)
+            H_q[i] = float(coeffs[0])
 
-    tau_q   = q * H_q - 1.0
-    alpha   = np.gradient(tau_q, q)
-    f_alpha = q * alpha - tau_q
+    # ── Legendre transform ────────────────────────────────────────────────
+    tau_q   = q.copy() * H_q.copy() - 1.0
+    alpha   = np.gradient(tau_q.copy(), q.copy())
+    f_alpha = q.copy() * alpha.copy() - tau_q.copy()
 
+    # ── Scalar extraction ─────────────────────────────────────────────────
     valid = np.isfinite(f_alpha) & np.isfinite(alpha) & (f_alpha >= 0)
     if valid.sum() < 4:
         alpha_0 = f_max = delta_alpha = asymmetry = np.nan
     else:
-        alpha_v     = alpha[valid]
-        f_v         = f_alpha[valid]
+        alpha_v     = alpha[valid].copy()
+        f_v         = f_alpha[valid].copy()
         peak_idx    = int(np.argmax(f_v))
         alpha_0     = float(alpha_v[peak_idx])
         f_max       = float(f_v[peak_idx])
         delta_alpha = float(alpha_v.max() - alpha_v.min())
-        asymmetry   = float((alpha_0 - alpha_v.min()) / (delta_alpha + 1e-10) - 0.5)
+        asymmetry   = float(
+            (alpha_0 - float(alpha_v.min())) / (delta_alpha + 1e-10) - 0.5
+        )
 
-    if surrogate_results is not None:
-        delta_alpha_nl = delta_alpha - surrogate_results.get("delta_alpha", np.nan)
-    else:
-        delta_alpha_nl = np.nan
-
+    # ── Return fresh copies only — no views, no aliases ──────────────────
     return {
-        "q":               q,
-        "H_q":             H_q,
-        "tau_q":           tau_q,
-        "alpha":           alpha,
-        "f_alpha":         f_alpha,
-        "alpha_0":         alpha_0,
-        "f_max":           f_max,
-        "delta_alpha":     delta_alpha,
-        "asymmetry":       asymmetry,
-        "delta_alpha_nl":  delta_alpha_nl,
-        "lag_s":           lag_s,
-        "Fqs":             Fqs,
-        "scale_min_s":     lo,
-        "scale_max_s":     hi,
+        "q":           q.copy(),
+        "H_q":         H_q.copy(),
+        "tau_q":       tau_q.copy(),
+        "alpha":       alpha.copy(),
+        "f_alpha":     f_alpha.copy(),
+        "alpha_0":     alpha_0,
+        "f_max":       f_max,
+        "delta_alpha": delta_alpha,
+        "asymmetry":   asymmetry,
+        "lag_s":       lag_s.copy(),
+        "Fqs":         Fqs.copy(),
+        "scale_min_s": lo,
+        "scale_max_s": hi,
     }
 
 
 def _nan_to_none(v):
-    """Convert float NaN → None for JSON serialisation."""
     if v is None:
         return None
     try:
         fv = float(v)
-        return None if fv != fv else fv   # NaN check: NaN != NaN
+        return None if (fv != fv) else fv
     except Exception:
         return None
 
 
 def spectrum_scalars(results):
-    """Flat JSON-serialisable dict for one channel/session row."""
-    H_q = results["H_q"]
+    H_q      = results["H_q"].copy()
     finite_H = H_q[np.isfinite(H_q)]
-    h_range = float(finite_H.max() - finite_H.min()) if len(finite_H) > 0 else None
-
+    h_range  = float(finite_H.max() - finite_H.min()) if len(finite_H) > 0 else None
     return {
         "delta_alpha":    _nan_to_none(results["delta_alpha"]),
         "alpha_0":        _nan_to_none(results["alpha_0"]),
         "f_max":          _nan_to_none(results["f_max"]),
         "asymmetry":      _nan_to_none(results["asymmetry"]),
-        "delta_alpha_nl": _nan_to_none(results["delta_alpha_nl"]),
+        "delta_alpha_nl": _nan_to_none(results.get("delta_alpha_nl", np.nan)),
         "H_q_range":      _nan_to_none(h_range),
     }
 
 
 def run_channel_mfdfa(
     signal_50hz,
-    n_surrogates  = 19,
-    base_seed     = 42,
-    fs            = 50.0,
-    order         = 2,
-    n_lags        = 80,
-    scale_min_s   = 0.3,
-    scale_max_s   = 30.0,
-    progress_cb   = None,
+    n_surrogates = 19,
+    base_seed    = 42,
+    fs           = 50.0,
+    order        = 2,
+    n_lags       = 80,
+    scale_min_s  = 0.3,
+    scale_max_s  = 30.0,
+    progress_cb  = None,
 ):
-    """
-    Full per-channel pipeline:
-      1. Real signal MFDFA
-      2. n_surrogates IAAFT surrogates (sequential)
-      3. Stats: p_iaaft, robust
-    
-    progress_cb(i, n_surrogates) called after each surrogate completes.
-    Returns a JSON-serialisable dict.
-    """
-    sig = np.asarray(signal_50hz, dtype=np.float64)
+    # Fresh copy of signal — never share with caller
+    sig = np.array(signal_50hz, dtype=np.float64, copy=True)
 
+    # ── Real signal ───────────────────────────────────────────────────────
     res = compute_multifractal_spectrum(
-        sig, fs=fs, order=order, q=DEFAULT_Q.copy(),
+        sig.copy(), fs=fs, order=order, q=None,
         n_lags=n_lags, scale_min_s=scale_min_s, scale_max_s=scale_max_s,
     )
 
-    surr_deltas    = []
-    surr_res_list  = []
+    # ── Surrogates — each gets its own fresh signal copy ──────────────────
+    surr_deltas   = []
+    surr_res_list = []
     for i in range(n_surrogates):
         rng  = np.random.default_rng(base_seed + i)
-        surr = surrogate_iaaft(sig, rng=rng)
+        surr = surrogate_iaaft(sig.copy(), rng=rng)
         sr   = compute_multifractal_spectrum(
-            surr, fs=fs, order=order, q=DEFAULT_Q.copy(),
+            surr, fs=fs, order=order, q=None,
             n_lags=n_lags, scale_min_s=scale_min_s, scale_max_s=scale_max_s,
         )
-        surr_deltas.append(sr["delta_alpha"])
+        surr_deltas.append(float(sr["delta_alpha"]))
         surr_res_list.append(sr)
         if progress_cb is not None:
             progress_cb(i + 1, n_surrogates)
 
-    surr_deltas     = np.array(surr_deltas, dtype=np.float64)
-    finite_surr     = surr_deltas[np.isfinite(surr_deltas)]
-    mean_surr_delta = float(np.mean(finite_surr)) if len(finite_surr) > 0 else np.nan
+    surr_arr    = np.array(surr_deltas, dtype=np.float64)
+    finite_surr = surr_arr[np.isfinite(surr_arr)]
+    mean_surr   = float(np.mean(finite_surr)) if len(finite_surr) > 0 else np.nan
 
-    res["delta_alpha_nl"] = res["delta_alpha"] - mean_surr_delta
+    delta_alpha_nl = float(res["delta_alpha"]) - mean_surr
+    p_iaaft = (
+        float(np.mean(surr_arr >= res["delta_alpha"]))
+        if len(finite_surr) > 0 else np.nan
+    )
+    robust = bool(
+        len(finite_surr) > 0
+        and float(res["delta_alpha"]) > float(np.max(finite_surr))
+    )
 
-    p_iaaft = float(np.mean(surr_deltas >= res["delta_alpha"])) if len(finite_surr) > 0 else np.nan
-    robust  = bool(len(finite_surr) > 0 and float(res["delta_alpha"]) > float(np.max(finite_surr)))
+    scalars                  = spectrum_scalars(res)
+    scalars["delta_alpha_nl"] = _nan_to_none(delta_alpha_nl)
+    scalars["p_iaaft"]        = _nan_to_none(p_iaaft)
+    scalars["robust"]         = robust
 
-    scalars           = spectrum_scalars(res)
-    scalars["p_iaaft"] = _nan_to_none(p_iaaft)
-    scalars["robust"]  = robust
-
-    # Median surrogate for overlay plot
+    # Median surrogate for overlay
     if len(finite_surr) > 0:
-        median_idx   = int(np.argsort(surr_deltas)[len(surr_deltas) // 2])
+        median_idx   = int(np.argsort(surr_arr)[len(surr_arr) // 2])
         ms           = surr_res_list[median_idx]
-        surr_alpha   = ms["alpha"].tolist()
-        surr_f_alpha = ms["f_alpha"].tolist()
+        surr_alpha   = ms["alpha"].copy().tolist()
+        surr_f_alpha = ms["f_alpha"].copy().tolist()
     else:
         surr_alpha = surr_f_alpha = []
 
     def _safe_list(arr):
-        return [_nan_to_none(v) for v in arr]
+        return [_nan_to_none(float(v)) for v in arr]
 
     return {
         "scalars":      scalars,
@@ -238,8 +250,8 @@ def run_channel_mfdfa(
         "alpha":        _safe_list(res["alpha"]),
         "f_alpha":      _safe_list(res["f_alpha"]),
         "alpha_0":      scalars["alpha_0"],
-        "surr_alpha":   _safe_list(surr_alpha),
-        "surr_f_alpha": _safe_list(surr_f_alpha),
+        "surr_alpha":   [_nan_to_none(float(v)) for v in surr_alpha],
+        "surr_f_alpha": [_nan_to_none(float(v)) for v in surr_f_alpha],
         "scale_min_s":  float(res["scale_min_s"]),
         "scale_max_s":  float(res["scale_max_s"]),
     }
