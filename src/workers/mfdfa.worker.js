@@ -132,6 +132,7 @@ _aligned = load_and_align(_zip_bytes_py, target_hz=100.0, gps_accuracy_max=20.0,
 import json as _json
 
 _sig_50 = downsample_50hz(_aligned[_ch_name], fs_in=100.0)
+print("sig lengths:", len(_aligned[_ch_name]), "->", len(_sig_50))
 
 def _py_progress_cb(i, n):
     _js_progress_cb(i, n)
