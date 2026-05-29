@@ -161,7 +161,7 @@ def downsample_50hz(signal_100hz, fs_in=100.0):
     Returns a Python list (JSON-serialisable).
     """
     from scipy.signal import resample_poly
-    x = np.asarray(signal_100hz, dtype=np.float64)
+    x = np.array(signal_100hz, dtype=np.float64, copy=True)
     return resample_poly(x, up=1, down=2).tolist()
 
 
