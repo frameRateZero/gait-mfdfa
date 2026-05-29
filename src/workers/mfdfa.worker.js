@@ -32,13 +32,17 @@ async function initPyodide() {
 
   self.postMessage({ type: "progress", stage: "loading_python", pct: 3 });
 
-  await pyodide.loadPackage(["numpy", "scipy", "micropip"]);
+  // Load numpy + scipy (bundled with Pyodide, fast)
+  await pyodide.loadPackage(["numpy", "scipy"]);
 
   self.postMessage({ type: "progress", stage: "loading_python", pct: 7 });
 
+  // Install MFDFA via micropip — pinned to same version as Colab
   await pyodide.runPythonAsync(`
 import micropip
 await micropip.install("MFDFA")
+import MFDFA as _mfdfa_pkg
+print("MFDFA version:", getattr(_mfdfa_pkg, "__version__", "unknown"))
 `);
 
   self.postMessage({ type: "progress", stage: "loading_python", pct: 10 });
@@ -48,15 +52,26 @@ await micropip.install("MFDFA")
 }
 
 // ── Load Python source from public/python/ ───────────────────────────────────
+// In Vite dev: served at /python/*.py
+// In Vite build (GitHub Pages): served at /gait-mfdfa/python/*.py
+// We detect the base by looking at the worker's own URL.
 function getPythonBase() {
-  const workerPath = self.location.pathname;
+  // self.location.href is e.g. http://localhost:5173/src/workers/mfdfa.worker.js
+  // or https://frameRateZero.github.io/gait-mfdfa/assets/mfdfa.worker-xxxx.js
+  // We want /python/ relative to the origin+base.
+  // Simplest: use import.meta.url and go up to the root.
+  // In a classic worker (importScripts), use self.location.origin +
+  // derive base from a known pattern.
+  const workerPath = self.location.pathname; // e.g. /gait-mfdfa/assets/worker.js
+  // Strip /assets/... or /src/workers/... to get the base
   const m = workerPath.match(/^(\/[^/]*\/?)(?:assets|src)\//);
   const base = m ? m[1] : "/";
   return self.location.origin + base + "python/";
 }
 
 async function loadPythonSource(filename) {
-  const url = getPythonBase() + filename;
+  const base = getPythonBase();
+  const url = base + filename;
   const resp = await fetch(url, { cache: "no-store" });
   if (!resp.ok) throw new Error(`Failed to load ${url}: ${resp.status}`);
   return resp.text();
@@ -77,6 +92,7 @@ self.onmessage = async (event) => {
 async function runPipeline({ zipBytes, metadata }) {
   if (!pyReady) await initPyodide();
 
+  // Stage: load Python modules
   self.postMessage({ type: "progress", stage: "loading_python", pct: 11 });
 
   const [pipelineSrc, mfdfaSrc, analysisSrc] = await Promise.all([
@@ -89,6 +105,7 @@ async function runPipeline({ zipBytes, metadata }) {
   await pyodide.runPythonAsync(mfdfaSrc);
   await pyodide.runPythonAsync(analysisSrc);
 
+  // Stage: parse zip + align
   self.postMessage({ type: "progress", stage: "parsing_zip", pct: 12 });
 
   pyodide.globals.set("_zip_bytes_js", new Uint8Array(zipBytes));
@@ -96,16 +113,12 @@ async function runPipeline({ zipBytes, metadata }) {
 import json as _json
 _zip_bytes_py = bytes(_zip_bytes_js.to_py())
 _aligned = load_and_align(_zip_bytes_py, target_hz=100.0, gps_accuracy_max=20.0, trim_s=60.0)
-import numpy as _np
-_ax = _np.array(_aligned['ax']); _ay = _np.array(_aligned['ay']); _az = _np.array(_aligned['az'])
-_aVT = _np.array(_aligned['a_VT'])
-print(f"Raw accel means: ax={_ax.mean():.3f}, ay={_ay.mean():.3f}, az={_az.mean():.3f}")
-print(f"Raw accel norm mean: {_np.sqrt(_ax**2+_ay**2+_az**2).mean():.3f} m/s2")
-print(f"a_VT mean={_aVT.mean():.3f}, std={_aVT.std():.3f}, range=[{_aVT.min():.2f},{_aVT.max():.2f}]")
+# Don't serialise the full aligned dict yet — keep as Python object
 `);
 
   self.postMessage({ type: "progress", stage: "tilt_corrected", pct: 14 });
 
+  // Stage: per-channel MFDFA
   const CHANNELS = ["a_VT", "a_ML", "a_AP", "g_YAW", "g_ROLL", "g_PITCH"];
   const channelResults = {};
   const N_CH = CHANNELS.length;
@@ -117,10 +130,13 @@ print(f"a_VT mean={_aVT.mean():.3f}, std={_aVT.std():.3f}, range=[{_aVT.min():.2
 
     self.postMessage({ type: "progress", stage: "mfdfa", channel: ch, pct: Math.round(basePct) });
 
+    // Set up Python-side progress callback that posts JS messages
     pyodide.globals.set("_ch_name", ch);
     pyodide.globals.set("_base_pct_js", basePct);
     pyodide.globals.set("_pct_per_ch_js", PCT_PER_CH);
 
+    // Define a Python progress callback
+    // Pyodide allows calling JS from Python via pyodide.ffi
     const progressFn = (iSurr, nSurr) => {
       const pct = basePct + PCT_PER_CH * (iSurr / nSurr);
       self.postMessage({
@@ -137,9 +153,10 @@ print(f"a_VT mean={_aVT.mean():.3f}, std={_aVT.std():.3f}, range=[{_aVT.min():.2
     await pyodide.runPythonAsync(`
 import json as _json
 
+# Downsample channel to 50 Hz
 _sig_50 = downsample_50hz(_aligned[_ch_name], fs_in=100.0)
-print("sig lengths:", len(_aligned[_ch_name]), "->", len(_sig_50))
 
+# Wrap JS progress callback
 def _py_progress_cb(i, n):
     _js_progress_cb(i, n)
 
@@ -159,6 +176,8 @@ _ch_result_json = _json.dumps(_ch_result)
 
     const chJson = pyodide.globals.get("_ch_result_json");
     const chResult = JSON.parse(chJson);
+
+    // Add classification (mirrors Python analysis.py)
     chResult.scalars.mf_class = classifyMF(chResult.scalars);
     channelResults[ch] = chResult;
 
@@ -166,6 +185,7 @@ _ch_result_json = _json.dumps(_ch_result)
                        pct: Math.round(basePct + PCT_PER_CH) });
   }
 
+  // Extract aligned summary (lightweight subset for storage)
   await pyodide.runPythonAsync(`
 _aligned_summary = {
     "time":        _aligned["time"],
@@ -188,9 +208,9 @@ _aligned_summary_json = _json.dumps(_aligned_summary)
 
   const sessionResult = {
     metadata,
-    session_id:   metadata.session_id,
-    processed_at: new Date().toISOString(),
-    channels:     channelResults,
+    session_id:    metadata.session_id,
+    processed_at:  new Date().toISOString(),
+    channels:      channelResults,
     aligned,
   };
 
