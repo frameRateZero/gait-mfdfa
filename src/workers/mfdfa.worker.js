@@ -96,6 +96,12 @@ async function runPipeline({ zipBytes, metadata }) {
 import json as _json
 _zip_bytes_py = bytes(_zip_bytes_js.to_py())
 _aligned = load_and_align(_zip_bytes_py, target_hz=100.0, gps_accuracy_max=20.0, trim_s=60.0)
+import numpy as _np
+_ax = _np.array(_aligned['ax']); _ay = _np.array(_aligned['ay']); _az = _np.array(_aligned['az'])
+_aVT = _np.array(_aligned['a_VT'])
+print(f"Raw accel means: ax={_ax.mean():.3f}, ay={_ay.mean():.3f}, az={_az.mean():.3f}")
+print(f"Raw accel norm mean: {_np.sqrt(_ax**2+_ay**2+_az**2).mean():.3f} m/s2")
+print(f"a_VT mean={_aVT.mean():.3f}, std={_aVT.std():.3f}, range=[{_aVT.min():.2f},{_aVT.max():.2f}]")
 `);
 
   self.postMessage({ type: "progress", stage: "tilt_corrected", pct: 14 });
