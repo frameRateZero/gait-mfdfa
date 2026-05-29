@@ -32,7 +32,7 @@ async function initPyodide() {
 
   self.postMessage({ type: "progress", stage: "loading_python", pct: 3 });
 
-  await pyodide.loadPackage(["numpy", "scipy"]);
+  await pyodide.loadPackage(["numpy", "scipy", "micropip"]);
 
   self.postMessage({ type: "progress", stage: "loading_python", pct: 7 });
 
