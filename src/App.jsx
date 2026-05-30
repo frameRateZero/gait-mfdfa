@@ -82,8 +82,8 @@ export default function App() {
       const JSZip = (await import("jszip")).default;
       const zip = await JSZip.loadAsync(zipFile);
       
-      const accelFile = zip.file("Accelerometer.csv");
-      const gyroFile  = zip.file("Gyroscope.csv");
+      const accelFile = zip.file(/Accelerometer\.csv$/)[0];
+      const gyroFile  = zip.file(/Gyroscope\.csv$/)[0];
 
       if (!accelFile || !gyroFile) {
         throw new Error("Missing structural data tracks. Check Phyphox configuration logs.");
