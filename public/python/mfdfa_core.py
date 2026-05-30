@@ -90,6 +90,15 @@ def compute_multifractal_spectrum(
     )
     lag   = lag.flatten().astype(int).copy()
     Fqs   = np.array(Fqs, dtype=np.float64, copy=True)
+    
+    # ── DEFENSIVE SHAPE FIX ───────────────────────────────────────────────
+    # Ensure Fqs is oriented as (n_lags, n_q) so that Fqs[scale_mask, i] 
+    # correctly grabs the scale line for the i-th q. 
+    # If rows match len(q) instead of lag_range, transpose it.
+    if Fqs.shape[0] == len(q) and Fqs.shape[1] == len(lag_range):
+        Fqs = Fqs.T
+    # ──────────────────────────────────────────────────────────────────────
+
     lag_s = lag / float(fs)
 
     # ── scale window ──────────────────────────────────────────────────────
@@ -113,7 +122,7 @@ def compute_multifractal_spectrum(
         if finite.sum() >= 4:
             coeffs = np.polyfit(log_lag_fit[finite], log_F[finite], 1)
             H_q[i] = float(coeffs[0])
-
+            
     # ── Legendre transform ────────────────────────────────────────────────
     tau_q = q.copy() * H_q.copy() - 1.0
 
