@@ -32,6 +32,7 @@ export default function App() {
 
   // Cache strings for the Python modules
   const pythonScriptsRef = useRef({ pipeline: "", mfdfa: "", analysis: "" });
+  const workerRef = useRef([]);
 
   // Load baseline script strings from public path upon initial mount
   useEffect(() => {
@@ -127,7 +128,7 @@ export default function App() {
     // Vite Explicit Worker Compilation Hook (?worker&type=module)
     // This forces Vite to treat the file as an isolated worker asset during compilation and deployment
     const worker = new Worker(
-      new URL("./workers/mfdfa.worker.js?worker&type=module", import.meta.url)
+      new URL("./workers/mfdfa.worker.js", import.meta.url), { type: "module" }
     );
     workerRef.current = worker;
 
