@@ -132,6 +132,8 @@ def compute_multifractal_spectrum(
     _b.print(f"H_q[:5]: {[round(x,4) for x in H_q[:5].tolist()]}")
     _b.print(f"H_q[-5:]: {[round(x,4) for x in H_q[-5:].tolist()]}")
     _b.print(f"tau_q[:5]: {[round(x,4) for x in tau_q[:5].tolist()]}")
+    if i == 0:
+        _b.print(f"i=0 log_F finite: {finite.sum()}/{len(finite)}, min={log_F[finite].min():.2f}, max={log_F[finite].max():.2f}")
     
     # Calculate alpha and f_alpha using analytical difference spacing
     # to protect against WASM float precision gradient drift
