@@ -1,7 +1,9 @@
 /**
  * src/App.jsx
  * ===========
- * Multi-threaded Parallel Core Orchestration. Update
+ * Multi-threaded Parallel Core Orchestration for GAIT MFDFA PWA.
+ * Spawns concurrent, parallelized worker environments to bypass WASM compilation cache bottlenecks.
+ * Vite production deployment safe.
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -28,12 +30,15 @@ export default function App() {
   const [appReady,      setAppReady]      = useState(false);
   const [workerError,   setWorkerError]   = useState(null);
 
+  // Cache strings for the Python modules
   const pythonScriptsRef = useRef({ pipeline: "", mfdfa: "", analysis: "" });
 
+  // Load baseline script strings from public path upon initial mount
   useEffect(() => {
     async function precacheScripts() {
       try {
-        const base = window.location.origin + window.location.pathname.replace(/(assets|src)\/.*$/, "") + "python/";
+        // Use relative pathing compatible with root domains or sub-path paths (like GH Pages)
+        const base = "./python/"; 
         const [p, m, a] = await Promise.all([
           fetch(`${base}pipeline.py?v=${Date.now()}`).then(r => r.text()),
           fetch(`${base}mfdfa_core.py?v=${Date.now()}`).then(r => r.text()),
@@ -42,14 +47,14 @@ export default function App() {
         pythonScriptsRef.current = { pipeline: p, mfdfa: m, analysis: a };
         setAppReady(true);
       } catch (err) {
-        setWorkerError(`Failed to cache modules: ${err.message}`);
+        setWorkerError(`Failed to cache analytical python modules: ${err.message}`);
       }
     }
     precacheScripts();
     getAllSessions().then(setAllSessions).catch(console.error);
   }, []);
 
-  // Fast, streaming parsing block for text rows
+  // High-performance streaming parsing block for Phyphox CSV text data rows
   const parsePhyphoxCSVText = (text) => {
     const lines = text.split("\n");
     const ax = [], ay = [], az = [];
@@ -69,10 +74,10 @@ export default function App() {
   const handleFormSubmit = useCallback(async ({ zipFile, metadata }) => {
     setWorkerError(null);
     setView(VIEWS.PROCESSING);
-    setProgress({ stage: "Extracting stream packets...", pct: 10 });
+    setProgress({ stage: "Extracting stream packets from Zip...", pct: 10 });
 
     try {
-      // Dynamic import of JSZip to ensure it remains non-blocking
+      // Dynamic import of JSZip to protect bundle size and ensure non-blocking UI
       const JSZip = (await import("jszip")).default;
       const zip = await JSZip.loadAsync(zipFile);
       
@@ -88,16 +93,21 @@ export default function App() {
         gyroFile.async("text")
       ]);
 
-      setProgress({ stage: "Aligning matrices...", pct: 20 });
+      setProgress({ stage: "Parsing timeseries arrays...", pct: 20 });
       const aData = parsePhyphoxCSVText(accelText);
       const gData = parsePhyphoxCSVText(gyroText);
 
+      // Verify matching array length constraints
+      if (aData.ax.length === 0) {
+        throw new Error("Accelerometer data stream is empty.");
+      }
+
       const rawDataBundle = {
         ax: aData.ax, ay: aData.ay, az: aData.az,
-        gx: gData.ax, gy: gData.ay, gz: gData.az // map gyro parameters
+        gx: gData.ax, gy: gData.ay, gz: gData.az
       };
 
-      // Dispatched to the multi-threaded array framework
+      // Dispatch data bundle to the parallelized multi-threaded worker engine
       runParallelWorkerPool(rawDataBundle, metadata);
 
     } catch (err) {
@@ -106,6 +116,7 @@ export default function App() {
     }
   }, []);
 
+  // Orchestrate parallel thread matrix arrays
   function runParallelWorkerPool(rawDataBundle, metadata) {
     const completedChannels = {};
     const channelProgress = {};
@@ -113,15 +124,17 @@ export default function App() {
     CHANNELS.forEach(chName => {
       channelProgress[chName] = 0;
       
+      // Vite Explicit Worker Compilation Hook (?worker&type=module)
+      // This forces Vite to treat the file as an isolated worker asset during compilation and deployment
       const worker = new Worker(
-        new URL("./workers/mfdfa.worker.js", import.meta.url),
-        { type: "module" }
+        new URL("./workers/mfdfa.worker.js?worker&type=module", import.meta.url)
       );
 
       worker.onmessage = async (e) => {
         const { type, pct, channelName, data, message } = e.data;
 
         if (type === "ready") {
+          // Feed the script strings and raw streams to the dedicated core instance
           worker.postMessage({
             type: "run_channel",
             payload: {
@@ -136,11 +149,12 @@ export default function App() {
 
         if (type === "progress") {
           channelProgress[chName] = pct;
+          // Synthesize a weighted average progress score across all concurrent processing workers
           const totalPct = Math.round(
             20 + (Object.values(channelProgress).reduce((a, b) => a + b, 0) / (CHANNELS.length * 100)) * 75
           );
           setProgress({
-            stage: `Computing primary structures (${chName} parsing...)`,
+            stage: `Computing fractal profiles (${chName}: ${pct}%)`,
             pct: totalPct
           });
         }
@@ -149,8 +163,10 @@ export default function App() {
           completedChannels[channelName] = data;
           completedChannels[channelName].scalars.mf_class = classifyMF(data.scalars);
           
-          worker.terminate(); // Kill execution heap immediately
+          // HARD TERMINATION: Purges the entire Pyodide WebAssembly heap from OS thread RAM instantly
+          worker.terminate(); 
 
+          // If all 6 parallel workers have securely returned their payloads, save the bundle
           if (Object.keys(completedChannels).length === CHANNELS.length) {
             finalizeSession(rawDataBundle, completedChannels, metadata);
           }
@@ -168,13 +184,15 @@ export default function App() {
   async function finalizeSession(rawDataBundle, channelResults, metadata) {
     setProgress({ stage: "Committing database rows...", pct: 98 });
 
+    // Build unified schema matching IndexedDB and chart renderer structures
     const sessionResult = {
       metadata,
       session_id:    metadata.session_id,
       processed_at:  new Date().toISOString(),
       channels:      channelResults,
       aligned: {
-        time:        Array.from({ length: 1000 }, (_, i) => i * 0.02),
+        // Construct time grid grid using 100Hz delta spacing
+        time:        Array.from({ length: Math.min(1000, rawDataBundle.ax.length) }, (_, i) => i * 0.01),
         a_VT:        channelResults["a_VT"].aligned_slice || [],
         a_ML:        channelResults["a_ML"].aligned_slice || [],
         a_AP:        channelResults["a_AP"].aligned_slice || [],
@@ -211,7 +229,7 @@ export default function App() {
   }
 
   const handleDelete = useCallback(async (session_id) => {
-    if (!confirm("Delete this session?")) return;
+    if (!confirm("Delete this session completely?")) return;
     await deleteSession(session_id);
     const updated = await getAllSessions();
     setAllSessions(updated);
@@ -232,7 +250,7 @@ export default function App() {
       <header style={styles.header}>
         <span style={styles.logo}>GAIT MFDFA</span>
         <span style={styles.headerSub}>Parallel Web-Worker Core Matrix</span>
-        {appReady && <span style={styles.readyDot} title="Core Engines Pre-cached" />}
+        {appReady && <span style={styles.readyDot} title="All Multi-Thread Engines Pre-cached" />}
       </header>
 
       {workerError && (
