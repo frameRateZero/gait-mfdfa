@@ -81,10 +81,15 @@ def _interp_circular_deg(t_src, deg_src, t_grid):
 
 def correct_tilt_horizontal(ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw, fs=100.0):
     """
-    Static tilt correction using the quietest 5-second window.
-    Exact port of the Colab notebook function.
+    Static tilt correction optimized for horizontal, screen-forward mounting.
+    Gravity is primarily aligned with the phone's physical X-axis (ax).
+    
+    Frames:
+        - Row 0 -> Vertical (VT)
+        - Row 1 -> Mediolateral (ML)
+        - Row 2 -> Anteroposterior (AP)
 
-    Returns dict of 1-D numpy arrays:
+    Returns dict of 1-D float64 numpy arrays:
         a_VT, a_ML, a_AP, g_YAW, g_ROLL, g_PITCH
     """
     ax_raw = np.asarray(ax_raw, dtype=np.float64)
@@ -98,8 +103,8 @@ def correct_tilt_horizontal(ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw, fs=1
     win_n = int(5.0 * fs)
     step  = win_n // 2
 
+    # 1. Hunt for the single quietest 5-second window in the recording
     if n <= win_n:
-        # File too short — use full-signal mean
         ax_s = float(np.mean(ax_raw))
         ay_s = float(np.mean(ay_raw))
         az_s = float(np.mean(az_raw))
@@ -118,40 +123,52 @@ def correct_tilt_horizontal(ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw, fs=1
         ay_s   = float(np.mean(ay_raw[best_s:best_e]))
         az_s   = float(np.mean(az_raw[best_s:best_e]))
 
-    g_vector = np.array([ax_s, ay_s, az_s])
+    # 2. Extract the exact gravity unit vector (Vertical Anchor)
+    g_vector = np.array([ax_s, ay_s, az_s], dtype=np.float64)
     g_mag    = float(np.linalg.norm(g_vector))
-    z_axis   = g_vector / g_mag   # unit vector pointing down
+    z_axis   = g_vector / g_mag   # Unit vector pointing straight down
 
-    # Build orthogonal frame
-    az_guide = np.array([0., 0., 1.]) if abs(z_axis[2]) < 0.9 else np.array([0., 1., 0.])
-    x_axis   = np.cross(az_guide, z_axis)
-    x_axis  /= np.linalg.norm(x_axis)
-    y_axis   = np.cross(z_axis, x_axis)
+    # 3. Build remaining anatomical orthogonal vectors
+    # Since screen is forward, the phone's native Z-axis acts as the forward direction guide
+    az_guide = np.array([0.0, 0.0, 1.0], dtype=np.float64) if abs(z_axis[1]) < 0.9 else np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    
+    # Mediolateral axis (Lateral sway via Cross of Vertical and Forward)
+    y_axis   = np.cross(z_axis, az_guide)
+    y_axis  /= np.linalg.norm(y_axis)
+    
+    # Anteroposterior axis (Propulsion/Braking)
+    x_axis   = np.cross(y_axis, z_axis)
 
-    R = np.vstack([z_axis, x_axis, y_axis])   # (3, 3)
+    # 4. Construct Direction Cosine Matrix (DCM)
+    R = np.vstack([z_axis, y_axis, x_axis])   # Shape (3, 3)
 
-    # Rotate accelerometer
-    accel_mat = np.vstack([ax_raw, ay_raw, az_raw])   # (3, n)
-    accel_rot = (R @ accel_mat).T                      # (n, 3)
+    # 5. Transform acceleration vectors
+    accel_mat = np.vstack([ax_raw, ay_raw, az_raw])   # Shape (3, n)
+    accel_rot = (R @ accel_mat).T                     # Shape (n, 3)
 
-    a_VT = accel_rot[:, 0]
+    a_VT = accel_rot[:, 0].copy()
+    a_ML = accel_rot[:, 1].copy()
+    a_AP = accel_rot[:, 2].copy()
+
+    # 6. Global directional enforcement (Gravity positive on VT)
+    # Scales all three axes uniformly to preserve true spatial right-handed geometry
     if float(np.mean(a_VT[best_s:best_e])) < 0:
-        a_VT           = -a_VT
-        accel_rot[:, 2] = -accel_rot[:, 2]   # flip AP, keep right-handed
+        a_VT = -a_VT
+        a_ML = -a_ML
+        a_AP = -a_AP
 
-    # Rotate gyroscope with the same matrix
-    gyro_mat = np.vstack([gx_raw, gy_raw, gz_raw])
-    gyro_rot = (R @ gyro_mat).T
+    # 7. Transform gyroscope vectors using the exact same DCM parameters
+    gyro_mat = np.vstack([gx_raw, gy_raw, gz_raw])   # Shape (3, n)
+    gyro_rot = (R @ gyro_mat).T                      # Shape (n, 3)
 
     return {
         "a_VT":   a_VT,
-        "a_ML":   accel_rot[:, 1],
-        "a_AP":   accel_rot[:, 2],
-        "g_YAW":  gyro_rot[:, 0],
-        "g_ROLL": gyro_rot[:, 1],
-        "g_PITCH":gyro_rot[:, 2],
+        "a_ML":   a_ML,
+        "a_AP":   a_AP,
+        "g_YAW":  gyro_rot[:, 0].copy(),
+        "g_ROLL": gyro_rot[:, 1].copy(),
+        "g_PITCH":gyro_rot[:, 2].copy(),
     }
-
 
 # ── Downsampling ──────────────────────────────────────────────────────────────
 
