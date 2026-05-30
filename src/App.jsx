@@ -124,11 +124,12 @@ export default function App() {
     CHANNELS.forEach(chName => {
       channelProgress[chName] = 0;
       
-      // Vite Explicit Worker Compilation Hook (?worker&type=module)
-      // This forces Vite to treat the file as an isolated worker asset during compilation and deployment
-      const worker = new Worker(
-        new URL("./workers/mfdfa.worker.js?worker&type=module", import.meta.url)
-      );
+    // Vite Explicit Worker Compilation Hook (?worker&type=module)
+    // This forces Vite to treat the file as an isolated worker asset during compilation and deployment
+    const worker = new Worker(
+      new URL("./workers/mfdfa.worker.js?worker&type=module", import.meta.url)
+    );
+    workerRef.current = worker;
 
       worker.onmessage = async (e) => {
         const { type, pct, channelName, data, message } = e.data;
