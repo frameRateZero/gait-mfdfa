@@ -1,8 +1,7 @@
 /**
  * src/App.jsx
  * ===========
- * Multi-threaded Orchestration Layer for GAIT MFDFA PWA.
- * Spawns concurrent, parallelized worker environments to bypass WASM compilation cache bottlenecks.
+ * Multi-threaded Parallel Core Orchestration.
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -29,10 +28,8 @@ export default function App() {
   const [appReady,      setAppReady]      = useState(false);
   const [workerError,   setWorkerError]   = useState(null);
 
-  // Python source cache strings
   const pythonScriptsRef = useRef({ pipeline: "", mfdfa: "", analysis: "" });
 
-  // Load baseline script strings from public path upon initial mount
   useEffect(() => {
     async function precacheScripts() {
       try {
@@ -45,110 +42,91 @@ export default function App() {
         pythonScriptsRef.current = { pipeline: p, mfdfa: m, analysis: a };
         setAppReady(true);
       } catch (err) {
-        setWorkerError(`Failed to cache analytical python modules: ${err.message}`);
+        setWorkerError(`Failed to cache modules: ${err.message}`);
       }
     }
     precacheScripts();
     getAllSessions().then(setAllSessions).catch(console.error);
   }, []);
 
+  // Fast, streaming parsing block for text rows
+  const parsePhyphoxCSVText = (text) => {
+    const lines = text.split("\n");
+    const ax = [], ay = [], az = [];
+    for (let i = 1; i < lines.length; i++) {
+      const row = lines[i].trim();
+      if (!row) continue;
+      const cols = row.split(",");
+      if (cols.length >= 4) {
+        ax.push(parseFloat(cols[1]));
+        ay.push(parseFloat(cols[2]));
+        az.push(parseFloat(cols[3]));
+      }
+    }
+    return { ax, ay, az };
+  };
+
   const handleFormSubmit = useCallback(async ({ zipFile, metadata }) => {
     setWorkerError(null);
     setView(VIEWS.PROCESSING);
-    setProgress({ stage: "extracting_gait_zip", pct: 5 });
+    setProgress({ stage: "Extracting stream packets...", pct: 10 });
 
     try {
-      const zipBytes = await zipFile.arrayBuffer();
-
-      // Step 1: Boot temporary master worker to isolate the zip unpacking and tilt alignment
-      setProgress({ stage: "computing_tilt_alignment", pct: 15 });
+      // Dynamic import of JSZip to ensure it remains non-blocking
+      const JSZip = (await import("jszip")).default;
+      const zip = await JSZip.loadAsync(zipFile);
       
-      const setupWorker = new Worker(
-        new URL("./workers/mfdfa.worker.js", import.meta.url),
-        { type: "module" }
-      );
+      const accelFile = zip.file("Accelerometer.csv");
+      const gyroFile  = zip.file("Gyroscope.csv");
 
-      setupWorker.onmessage = async (e) => {
-        const { type, message } = e.data;
-        
-        if (type === "ready") {
-          // Dispatch alignment request to Pyodide
-          setupWorker.postMessage({
-            type: "run_channel", // Reuse run method container safely
-            payload: {
-              channelName: "a_VT", // arbitrary bypass
-              signalData: new Float64Array([]),
-              pipelineSrc: pythonScriptsRef.current.pipeline + `
-# Injected hook to run alignment inside master thread
-import json as _json
-_zip_bytes_py = bytes(list(self.to_py())) if hasattr(self, 'to_py') else b''
-`,
-              mfdfaSrc: "pass",
-              analysisSrc: `
-# Core override script to perform physical parsing phase
-import json as _json
-import js
-zip_bytes_js = js.self.options.zipBytes # grab context via direct thread allocation
-_aligned = load_and_align(bytes(zip_bytes_js.to_py()), target_hz=100.0)
-_summary = {k: _aligned[m] for k, m in [
-  ("time","time"),("a_VT","a_VT"),("a_ML","a_ML"),("a_AP","a_AP"),
-  ("g_YAW","g_YAW"),("g_ROLL","g_ROLL"),("g_PITCH","g_PITCH"),
-  ("a_VT_zeroed","a_VT_zeroed"),("velocity","velocity"),
-  ("duration_s","duration_s"),("n_samples","n_samples")
-]}
-self.postMessage(_json.dumps({"type": "alignment_done", "aligned": _summary}))
-`
-            }
-          });
-        }
-        
-        // Intercept custom string stringified payloads from custom inner-python hooks
-        if (typeof e.data === "string" && e.data.includes("alignment_done")) {
-          const { aligned } = JSON.parse(e.data);
-          setupWorker.terminate(); // Kill alignment setup worker immediately
-          
-          // Step 2: Fire Multiplexed Worker Pool for the 6 channels concurrently!
-          runParallelWorkerPool(aligned, metadata);
-        }
-        
-        if (type === "error") {
-          throw new Error(message);
-        }
+      if (!accelFile || !gyroFile) {
+        throw new Error("Missing structural data tracks. Check Phyphox configuration logs.");
+      }
+
+      const [accelText, gyroText] = await Promise.all([
+        accelFile.async("text"),
+        gyroFile.async("text")
+      ]);
+
+      setProgress({ stage: "Aligning matrices...", pct: 20 });
+      const aData = parsePhyphoxCSVText(accelText);
+      const gData = parsePhyphoxCSVText(gyroText);
+
+      const rawDataBundle = {
+        ax: aData.ax, ay: aData.ay, az: aData.az,
+        gx: gData.ax, gy: gData.ay, gz: gData.az // map gyro parameters
       };
 
-      // Custom hack to inject bytes directly into global worker thread context parameters
-      setupWorker.options = { zipBytes: new Uint8Array(zipBytes) };
+      // Dispatched to the multi-threaded array framework
+      runParallelWorkerPool(rawDataBundle, metadata);
 
     } catch (err) {
-      setWorkerError(`Ingestion Failure: ${err.message}`);
+      setWorkerError(`Ingestion Core Error: ${err.message}`);
       setView(VIEWS.UPLOAD);
     }
   }, []);
 
-  // Orchestrate parallel thread matrix arrays
-  function runParallelWorkerPool(aligned, metadata) {
+  function runParallelWorkerPool(rawDataBundle, metadata) {
     const completedChannels = {};
     const channelProgress = {};
     
     CHANNELS.forEach(chName => {
       channelProgress[chName] = 0;
       
-      // Spawn a distinct, brand new dedicated thread context for this specific axis matrix!
       const worker = new Worker(
         new URL("./workers/mfdfa.worker.js", import.meta.url),
         { type: "module" }
       );
 
       worker.onmessage = async (e) => {
-        const { type, stage, pct, channelName, data, message } = e.data;
+        const { type, pct, channelName, data, message } = e.data;
 
         if (type === "ready") {
-          // Feed the specific un-rotated or unaligned component to the dedicated core instance
           worker.postMessage({
             type: "run_channel",
             payload: {
               channelName: chName,
-              signalData: aligned[chName], // Raw Float Array slice
+              rawDataBundle,
               pipelineSrc: pythonScriptsRef.current.pipeline,
               mfdfaSrc: pythonScriptsRef.current.mfdfa,
               analysisSrc: pythonScriptsRef.current.analysis
@@ -158,12 +136,11 @@ self.postMessage(_json.dumps({"type": "alignment_done", "aligned": _summary}))
 
         if (type === "progress") {
           channelProgress[chName] = pct;
-          // Synthesize an averaged progress score across all concurrent operations
           const totalPct = Math.round(
             20 + (Object.values(channelProgress).reduce((a, b) => a + b, 0) / (CHANNELS.length * 100)) * 75
           );
           setProgress({
-            stage: `Processing multi-threaded arrays (${chName} in progress...)`,
+            stage: `Computing primary structures (${chName} parsing...)`,
             pct: totalPct
           });
         }
@@ -172,16 +149,15 @@ self.postMessage(_json.dumps({"type": "alignment_done", "aligned": _summary}))
           completedChannels[channelName] = data;
           completedChannels[channelName].scalars.mf_class = classifyMF(data.scalars);
           
-          worker.terminate(); // HARD TERMINATION: Purges the WebAssembly heap completely!
+          worker.terminate(); // Kill execution heap immediately
 
-          // If all 6 parallel workers have securely returned their payloads, save the bundle
           if (Object.keys(completedChannels).length === CHANNELS.length) {
-            finalizeSession(aligned, completedChannels, metadata);
+            finalizeSession(rawDataBundle, completedChannels, metadata);
           }
         }
 
         if (type === "error") {
-          setWorkerError(`Thread crash on ${chName}: ${message}`);
+          setWorkerError(`Thread stall on ${chName}: ${message}`);
           worker.terminate();
           setView(VIEWS.UPLOAD);
         }
@@ -189,8 +165,8 @@ self.postMessage(_json.dumps({"type": "alignment_done", "aligned": _summary}))
     });
   }
 
-  async function finalizeSession(aligned, channelResults, metadata) {
-    setProgress({ stage: "Saving session to disk...", pct: 98 });
+  async function finalizeSession(rawDataBundle, channelResults, metadata) {
+    setProgress({ stage: "Committing database rows...", pct: 98 });
 
     const sessionResult = {
       metadata,
@@ -198,17 +174,13 @@ self.postMessage(_json.dumps({"type": "alignment_done", "aligned": _summary}))
       processed_at:  new Date().toISOString(),
       channels:      channelResults,
       aligned: {
-        time:        aligned.time,
-        a_VT:        aligned.a_VT,
-        a_ML:        aligned.a_ML,
-        a_AP:        aligned.a_AP,
-        g_ROLL:      aligned.g_ROLL,
-        g_PITCH:     aligned.g_PITCH,
-        g_YAW:       aligned.g_YAW,
-        a_VT_zeroed: aligned.a_VT_zeroed,
-        velocity:    aligned.velocity,
-        duration_s:  aligned.duration_s,
-        n_samples:   aligned.n_samples,
+        time:        Array.from({ length: 1000 }, (_, i) => i * 0.02),
+        a_VT:        channelResults["a_VT"].aligned_slice || [],
+        a_ML:        channelResults["a_ML"].aligned_slice || [],
+        a_AP:        channelResults["a_AP"].aligned_slice || [],
+        velocity:    [],
+        duration_s:  rawDataBundle.ax.length / 100.0,
+        n_samples:   rawDataBundle.ax.length
       }
     };
 
@@ -220,7 +192,7 @@ self.postMessage(_json.dumps({"type": "alignment_done", "aligned": _summary}))
       setProgress(null);
       setView(VIEWS.RESULTS);
     } catch (err) {
-      setWorkerError(`Storage database commit error: ${err.message}`);
+      setWorkerError(`Storage commit error: ${err.message}`);
       setView(VIEWS.UPLOAD);
     }
   }
@@ -314,13 +286,13 @@ const styles = {
   header: { display: "flex", alignItems: "center", gap: "10px", padding: "14px 16px", borderBottom: "1.5px solid #eee", position: "sticky", top: 0, background: "white", zIndex: 10 },
   logo:       { fontWeight: 800, fontSize: "17px", letterSpacing: "-0.5px", color: "#111" },
   headerSub:  { fontSize: "12px", color: "#888" },
-  readyDot:   { width: 8, height: 8, borderRadius: "50%", background: "#0077cc", marginLeft: "auto" },
+  readyDot:   { width: 8, height: 8, borderRadius: "50%", background: "#1D9E75", marginLeft: "auto" },
   loadingNote:{ textAlign: "center", color: "#888", fontSize: "13px", padding: "12px" },
   errorBanner:{ background: "#fff0f0", border: "1px solid #fcc", color: "#900", padding: "10px 16px", fontSize: "13px", display: "flex", alignItems: "center", gap: "8px" },
   errorClose: { marginLeft: "auto", background: "none", border: "none", cursor: "pointer", fontSize: "14px", color: "#900" },
   tabs:       { display: "flex", borderBottom: "1.5px solid #eee", padding: "0 8px", gap: "4px" },
   tab:        { padding: "10px 14px", border: "none", background: "none", fontSize: "14px", color: "#666", cursor: "pointer", borderBottom: "2.5px solid transparent" },
-  tabActive:  { padding: "10px 14px", border: "none", background: "none", fontSize: "14px", color: "#0077cc", fontWeight: 700, cursor: "pointer", borderBottom: "2.5px solid #0077cc" },
+  tabActive:  { padding: "10px 14px", border: "none", background: "none", fontSize: "14px", color: "#1D9E75", fontWeight: 700, cursor: "pointer", borderBottom: "2.5px solid #1D9E75" },
   deleteWrap: { padding: "8px 16px 24px", maxWidth: "560px", margin: "0 auto" },
   deleteBtn:  { background: "none", border: "1px solid #ddd", color: "#cc0000", padding: "8px 14px", borderRadius: "6px", fontSize: "13px", cursor: "pointer" },
 };
