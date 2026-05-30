@@ -122,15 +122,27 @@ def compute_multifractal_spectrum(
         if finite.sum() >= 4:
             coeffs = np.polyfit(log_lag_fit[finite], log_F[finite], 1)
             H_q[i] = float(coeffs[0])
-            
-    # ── Legendre transform ────────────────────────────────────────────────
-    tau_q = q.copy() * H_q.copy() - 1.0
 
-    # Let np.gradient handle the entire monotonic q-array globally. 
-    # It natively and correctly accounts for the non-uniform step crossing the q=0 gap.
-    alpha = np.gradient(tau_q.copy(), q.copy())
-
-    f_alpha = q.copy() * alpha.copy() - tau_q.copy()
+    # ── Robust Native Legendre Transform ──────────────────────────────────
+    # Calculate tau_q cleanly
+    tau_q = q.copy() * H_q - 1.0
+    
+    # Calculate alpha and f_alpha using analytical difference spacing
+    # to protect against WASM float precision gradient drift
+    dq = np.diff(q)
+    
+    # Ensure q has uniform spacing for analytical derivative
+    if np.allclose(dq, dq[0], atol=1e-5):
+        # Clean analytical forward-difference derivative for stability
+        alpha = np.zeros_like(tau_q)
+        alpha[:-1] = np.diff(tau_q) / dq[0]
+        # Backward difference for the terminal point
+        alpha[-1] = (tau_q[-1] - tau_q[-2]) / dq[-1]
+    else:
+        # Fallback to standard gradient if q spacing is non-uniform
+        alpha = np.gradient(tau_q, q)
+        
+    f_alpha = q * alpha - tau_q
 
     # ── Scalar extraction ─────────────────────────────────────────────────
     valid = np.isfinite(f_alpha) & np.isfinite(alpha) & (f_alpha >= 0)
