@@ -126,6 +126,12 @@ def compute_multifractal_spectrum(
     # ── Robust Native Legendre Transform ──────────────────────────────────
     # Calculate tau_q cleanly
     tau_q = q.copy() * H_q - 1.0
+
+    import builtins as _b
+    _b.print(f"Fqs shape: {Fqs.shape}, n_lags: {len(lag_range)}, n_q: {len(q)}")
+    _b.print(f"H_q[:5]: {[round(x,4) for x in H_q[:5].tolist()]}")
+    _b.print(f"H_q[-5:]: {[round(x,4) for x in H_q[-5:].tolist()]}")
+    _b.print(f"tau_q[:5]: {[round(x,4) for x in tau_q[:5].tolist()]}")
     
     # Calculate alpha and f_alpha using analytical difference spacing
     # to protect against WASM float precision gradient drift
