@@ -45,7 +45,7 @@ self.onmessage = async (event) => {
 };
 
 async function computeChannel({ channelName, rawDataBundle, pipelineSrc, mfdfaSrc, analysisSrc }) {
-  self.postMessage({ type: "progress", stage: "processing", channel: channelName, pct: 15 });
+  self.postMessage({ type: "progress", stage: "loading_modules", channel: channelName, pct: 15 });
 
   // Load python definitions
   await pyodide.runPythonAsync(pipelineSrc);
