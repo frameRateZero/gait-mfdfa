@@ -85,7 +85,9 @@ def compute_multifractal_spectrum(
         )
 
     # ── MFDFA call — pass copies so the package cannot mutate our arrays ──
-    lag, Fqs = _MFDFA_fn(
+    # Always import fresh to pick up any module reload
+    from MFDFA import MFDFA as _fresh_MFDFA
+    lag, Fqs = _fresh_MFDFA(
         sig.copy(), lag=lag_range.copy(), q=q.copy(), order=order
     )
     lag   = lag.flatten().astype(int).copy()
