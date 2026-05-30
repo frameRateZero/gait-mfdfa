@@ -32,6 +32,7 @@ export default function App() {
 
   // Cache strings for the Python modules
   const pythonScriptsRef = useRef({ pipeline: "", mfdfa: "", analysis: "" });
+  // Track live worker handles so they can be terminated on unmount / error
   const workerRef = useRef([]);
 
   // Load baseline script strings from public path upon initial mount
@@ -39,7 +40,7 @@ export default function App() {
     async function precacheScripts() {
       try {
         // Use relative pathing compatible with root domains or sub-path paths (like GH Pages)
-        const base = "./python/"; 
+        const base = "./python/";
         const [p, m, a] = await Promise.all([
           fetch(`${base}pipeline.py?v=${Date.now()}`).then(r => r.text()),
           fetch(`${base}mfdfa_core.py?v=${Date.now()}`).then(r => r.text()),
@@ -55,38 +56,40 @@ export default function App() {
     getAllSessions().then(setAllSessions).catch(console.error);
   }, []);
 
-  // High-performance streaming parsing block for Phyphox CSV text data rows
+  // Parse Phyphox CSV — includes time column for interpolation onto regular grid in worker
   const parsePhyphoxCSVText = (text) => {
     const lines = text.split("\n");
-    const ax = [], ay = [], az = [];
+    const t = [], ax = [], ay = [], az = [];
     for (let i = 1; i < lines.length; i++) {
       const row = lines[i].trim();
       if (!row) continue;
       const cols = row.split(",");
       if (cols.length >= 4) {
+        t.push(parseFloat(cols[0]));
         ax.push(parseFloat(cols[1]));
         ay.push(parseFloat(cols[2]));
         az.push(parseFloat(cols[3]));
       }
     }
-    return { ax, ay, az };
+    return { t, ax, ay, az };
   };
 
   const handleFormSubmit = useCallback(async ({ zipFile, metadata }) => {
     setWorkerError(null);
     setView(VIEWS.PROCESSING);
-    setProgress({ stage: "Extracting stream packets from Zip...", pct: 10 });
+    setProgress({ stage: "extracting", pct: 10 });
 
     try {
       // Dynamic import of JSZip to protect bundle size and ensure non-blocking UI
       const JSZip = (await import("jszip")).default;
       const zip = await JSZip.loadAsync(zipFile);
-      
+
+      // Match by filename regardless of subfolder (Phyphox exports into a dated subdirectory)
       const accelFile = zip.file(/Accelerometer\.csv$/)[0];
       const gyroFile  = zip.file(/Gyroscope\.csv$/)[0];
 
       if (!accelFile || !gyroFile) {
-        throw new Error("Missing structural data tracks. Check Phyphox configuration logs.");
+        throw new Error("Missing Accelerometer.csv or Gyroscope.csv. Check Phyphox export configuration.");
       }
 
       const [accelText, gyroText] = await Promise.all([
@@ -94,21 +97,21 @@ export default function App() {
         gyroFile.async("text")
       ]);
 
-      setProgress({ stage: "Parsing timeseries arrays...", pct: 20 });
+      setProgress({ stage: "parsing", pct: 20 });
       const aData = parsePhyphoxCSVText(accelText);
       const gData = parsePhyphoxCSVText(gyroText);
 
-      // Verify matching array length constraints
       if (aData.ax.length === 0) {
         throw new Error("Accelerometer data stream is empty.");
       }
 
+      // Include time arrays so the worker can interpolate onto a regular 100Hz grid,
+      // matching the Colab pipeline exactly (Phyphox samples at irregular intervals)
       const rawDataBundle = {
-        ax: aData.ax, ay: aData.ay, az: aData.az,
-        gx: gData.ax, gy: gData.ay, gz: gData.az
+        t_a: aData.t,  ax: aData.ax, ay: aData.ay, az: aData.az,
+        t_g: gData.t,  gx: gData.ax, gy: gData.ay, gz: gData.az,
       };
 
-      // Dispatch data bundle to the parallelized multi-threaded worker engine
       runParallelWorkerPool(rawDataBundle, metadata);
 
     } catch (err) {
@@ -117,58 +120,57 @@ export default function App() {
     }
   }, []);
 
-  // Orchestrate parallel thread matrix arrays
+  // Orchestrate parallel thread matrix
   function runParallelWorkerPool(rawDataBundle, metadata) {
     const completedChannels = {};
-    const channelProgress = {};
-    
+    const channelProgress   = {};
+
     CHANNELS.forEach(chName => {
       channelProgress[chName] = 0;
-      
-    // Vite Explicit Worker Compilation Hook (?worker&type=module)
-    // This forces Vite to treat the file as an isolated worker asset during compilation and deployment
-    const worker = new Worker(
-      new URL("./workers/mfdfa.worker.js", import.meta.url), { type: "module" }
-    );
-    workerRef.current = worker;
+
+      // Vite resolves worker assets from new URL(path, import.meta.url) at build time.
+      // The ?worker query is only valid for static `import ... from '...?worker'` syntax —
+      // it must NOT be included here or Vite will fail to resolve the asset.
+      const worker = new Worker(
+        new URL("./workers/mfdfa.worker.js", import.meta.url),
+        { type: "module" }
+      );
+      workerRef.current.push(worker);
 
       worker.onmessage = async (e) => {
         const { type, pct, channelName, data, message } = e.data;
 
         if (type === "ready") {
-          // Feed the script strings and raw streams to the dedicated core instance
           worker.postMessage({
             type: "run_channel",
             payload: {
               channelName: chName,
               rawDataBundle,
               pipelineSrc: pythonScriptsRef.current.pipeline,
-              mfdfaSrc: pythonScriptsRef.current.mfdfa,
-              analysisSrc: pythonScriptsRef.current.analysis
+              mfdfaSrc:    pythonScriptsRef.current.mfdfa,
+              analysisSrc: pythonScriptsRef.current.analysis,
             }
           });
         }
 
         if (type === "progress") {
           channelProgress[chName] = pct;
-          // Synthesize a weighted average progress score across all concurrent processing workers
           const totalPct = Math.round(
             20 + (Object.values(channelProgress).reduce((a, b) => a + b, 0) / (CHANNELS.length * 100)) * 75
           );
           setProgress({
             stage: `Computing fractal profiles (${chName}: ${pct}%)`,
-            pct: totalPct
+            pct: totalPct,
           });
         }
 
         if (type === "channel_result") {
           completedChannels[channelName] = data;
           completedChannels[channelName].scalars.mf_class = classifyMF(data.scalars);
-          
-          // HARD TERMINATION: Purges the entire Pyodide WebAssembly heap from OS thread RAM instantly
-          worker.terminate(); 
 
-          // If all 6 parallel workers have securely returned their payloads, save the bundle
+          worker.terminate();
+          workerRef.current = workerRef.current.filter(w => w !== worker);
+
           if (Object.keys(completedChannels).length === CHANNELS.length) {
             finalizeSession(rawDataBundle, completedChannels, metadata);
           }
@@ -177,6 +179,7 @@ export default function App() {
         if (type === "error") {
           setWorkerError(`Thread stall on ${chName}: ${message}`);
           worker.terminate();
+          workerRef.current = workerRef.current.filter(w => w !== worker);
           setView(VIEWS.UPLOAD);
         }
       };
@@ -184,23 +187,27 @@ export default function App() {
   }
 
   async function finalizeSession(rawDataBundle, channelResults, metadata) {
-    setProgress({ stage: "Committing database rows...", pct: 98 });
+    setProgress({ stage: "saving", pct: 98 });
 
-    // Build unified schema matching IndexedDB and chart renderer structures
+    // n_samples derived from interpolated length returned by the worker via aligned_slice
+    const alignedLen = (channelResults["a_VT"]?.aligned_slice || []).length;
+
     const sessionResult = {
       metadata,
-      session_id:    metadata.session_id,
-      processed_at:  new Date().toISOString(),
-      channels:      channelResults,
+      session_id:   metadata.session_id,
+      processed_at: new Date().toISOString(),
+      channels:     channelResults,
       aligned: {
-        // Construct time grid grid using 100Hz delta spacing
-        time:        Array.from({ length: Math.min(1000, rawDataBundle.ax.length) }, (_, i) => i * 0.01),
-        a_VT:        channelResults["a_VT"].aligned_slice || [],
-        a_ML:        channelResults["a_ML"].aligned_slice || [],
-        a_AP:        channelResults["a_AP"].aligned_slice || [],
-        velocity:    [],
-        duration_s:  rawDataBundle.ax.length / 100.0,
-        n_samples:   rawDataBundle.ax.length
+        time:       Array.from({ length: Math.min(2000, alignedLen) }, (_, i) => i * 0.01),
+        a_VT:       channelResults["a_VT"].aligned_slice || [],
+        a_ML:       channelResults["a_ML"].aligned_slice || [],
+        a_AP:       channelResults["a_AP"].aligned_slice || [],
+        velocity:   [],
+        // Duration from raw accel time span (pre-trim) — worker trims internally
+        duration_s: rawDataBundle.t_a.length > 0
+          ? rawDataBundle.t_a[rawDataBundle.t_a.length - 1] - rawDataBundle.t_a[0]
+          : 0,
+        n_samples:  alignedLen,
       }
     };
 
@@ -220,11 +227,12 @@ export default function App() {
   function classifyMF(row) {
     const { robust, delta_alpha, delta_alpha_nl, p_iaaft, asymmetry } = row;
     if (!robust) {
-      if ((asymmetry || 0) > 0.1 && (delta_alpha_nl || 0) < 0) return "smoothed_constrained";
+      if ((asymmetry ?? 0) > 0.1 && (delta_alpha_nl ?? 0) < 0) return "smoothed_constrained";
       return "unclassified";
     }
-    const isMF = (delta_alpha || 0) > 0.1;
-    const isNL = (delta_alpha_nl || 0) > 0.1 && (p_iaaft || 1) < 0.05;
+    const isMF = (delta_alpha    ?? 0) > 0.1;
+    // Use ?? not || so that p_iaaft=0.0 is treated as 0, not as the fallback 1
+    const isNL = (delta_alpha_nl ?? 0) > 0.1 && (p_iaaft ?? 1) < 0.05;
     if (!isMF) return "monofractal";
     if (isNL)  return "nonlinear_multifractal";
     return "linear_multifractal";
@@ -276,7 +284,7 @@ export default function App() {
       {(view === VIEWS.RESULTS || view === VIEWS.LONGITUDINAL) && currentResult && (
         <>
           <div style={styles.tabs}>
-            <TabBtn label="Results" active={view === VIEWS.RESULTS} onClick={() => setView(VIEWS.RESULTS)} />
+            <TabBtn label="Results"      active={view === VIEWS.RESULTS}      onClick={() => setView(VIEWS.RESULTS)} />
             <TabBtn label={`Longitudinal (${participantSessions.length})`} active={view === VIEWS.LONGITUDINAL} onClick={() => setView(VIEWS.LONGITUDINAL)} />
             <TabBtn label="+ New Session" onClick={() => { setCurrentResult(null); setView(VIEWS.UPLOAD); }} />
           </div>
@@ -302,17 +310,17 @@ function TabBtn({ label, active, onClick }) {
 }
 
 const styles = {
-  app:   { minHeight: "100vh", background: "#fff", fontFamily: "-apple-system, BlinkMacSystemFont, sans-serif" },
-  header: { display: "flex", alignItems: "center", gap: "10px", padding: "14px 16px", borderBottom: "1.5px solid #eee", position: "sticky", top: 0, background: "white", zIndex: 10 },
-  logo:       { fontWeight: 800, fontSize: "17px", letterSpacing: "-0.5px", color: "#111" },
-  headerSub:  { fontSize: "12px", color: "#888" },
-  readyDot:   { width: 8, height: 8, borderRadius: "50%", background: "#1D9E75", marginLeft: "auto" },
-  loadingNote:{ textAlign: "center", color: "#888", fontSize: "13px", padding: "12px" },
-  errorBanner:{ background: "#fff0f0", border: "1px solid #fcc", color: "#900", padding: "10px 16px", fontSize: "13px", display: "flex", alignItems: "center", gap: "8px" },
-  errorClose: { marginLeft: "auto", background: "none", border: "none", cursor: "pointer", fontSize: "14px", color: "#900" },
-  tabs:       { display: "flex", borderBottom: "1.5px solid #eee", padding: "0 8px", gap: "4px" },
-  tab:        { padding: "10px 14px", border: "none", background: "none", fontSize: "14px", color: "#666", cursor: "pointer", borderBottom: "2.5px solid transparent" },
-  tabActive:  { padding: "10px 14px", border: "none", background: "none", fontSize: "14px", color: "#1D9E75", fontWeight: 700, cursor: "pointer", borderBottom: "2.5px solid #1D9E75" },
-  deleteWrap: { padding: "8px 16px 24px", maxWidth: "560px", margin: "0 auto" },
-  deleteBtn:  { background: "none", border: "1px solid #ddd", color: "#cc0000", padding: "8px 14px", borderRadius: "6px", fontSize: "13px", cursor: "pointer" },
+  app:         { minHeight: "100vh", background: "#fff", fontFamily: "-apple-system, BlinkMacSystemFont, sans-serif" },
+  header:      { display: "flex", alignItems: "center", gap: "10px", padding: "14px 16px", borderBottom: "1.5px solid #eee", position: "sticky", top: 0, background: "white", zIndex: 10 },
+  logo:        { fontWeight: 800, fontSize: "17px", letterSpacing: "-0.5px", color: "#111" },
+  headerSub:   { fontSize: "12px", color: "#888" },
+  readyDot:    { width: 8, height: 8, borderRadius: "50%", background: "#1D9E75", marginLeft: "auto" },
+  loadingNote: { textAlign: "center", color: "#888", fontSize: "13px", padding: "12px" },
+  errorBanner: { background: "#fff0f0", border: "1px solid #fcc", color: "#900", padding: "10px 16px", fontSize: "13px", display: "flex", alignItems: "center", gap: "8px" },
+  errorClose:  { marginLeft: "auto", background: "none", border: "none", cursor: "pointer", fontSize: "14px", color: "#900" },
+  tabs:        { display: "flex", borderBottom: "1.5px solid #eee", padding: "0 8px", gap: "4px" },
+  tab:         { padding: "10px 14px", border: "none", background: "none", fontSize: "14px", color: "#666", cursor: "pointer", borderBottom: "2.5px solid transparent" },
+  tabActive:   { padding: "10px 14px", border: "none", background: "none", fontSize: "14px", color: "#1D9E75", fontWeight: 700, cursor: "pointer", borderBottom: "2.5px solid #1D9E75" },
+  deleteWrap:  { padding: "8px 16px 24px", maxWidth: "560px", margin: "0 auto" },
+  deleteBtn:   { background: "none", border: "1px solid #ddd", color: "#cc0000", padding: "8px 14px", borderRadius: "6px", fontSize: "13px", cursor: "pointer" },
 };
