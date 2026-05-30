@@ -1,7 +1,7 @@
 /**
  * src/App.jsx
  * ===========
- * Multi-threaded Parallel Core Orchestration.
+ * Multi-threaded Parallel Core Orchestration. Update
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
