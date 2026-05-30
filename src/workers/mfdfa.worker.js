@@ -1,17 +1,11 @@
 /**
  * src/workers/mfdfa.worker.js
  * ===========================
- * Pyodide Web Worker — GAIT MFDFA pipeline.
- *
- * Inbound:  { type: 'run', payload: { zipBytes: ArrayBuffer, metadata: object } }
- * Outbound: { type: 'ready' }
- *           { type: 'progress', stage, channel?, pct, surrogate?, n_surrogates? }
- *           { type: 'result', sessionResult }
- *           { type: 'error', message }
+ * Isolated Single-Channel Web Worker — GAIT MFDFA Pipeline.
+ * * Process exactly one signal channel per lifecycle to completely eliminate
+ * WebAssembly/C-extension memory layout contamination between axes.
  */
 
-// ── Pyodide CDN (pinned version) ─────────────────────────────────────────────
-// ESM workers must use dynamic import() — importScripts() is not available.
 let loadPyodide = null;
 
 async function ensurePyodide() {
@@ -26,145 +20,76 @@ let pyReady = false;
 
 async function initPyodide() {
   await ensurePyodide();
-  self.postMessage({ type: "progress", stage: "loading_python", pct: 1 });
+  self.postMessage({ type: "progress", stage: "loading_python", pct: 5 });
 
   pyodide = await loadPyodide();
+  await pyodide.loadPackage(["numpy", "scipy", "micropip"]);
 
-  self.postMessage({ type: "progress", stage: "loading_python", pct: 3 });
-
-  // Load numpy + scipy (bundled with Pyodide, fast)
-  await pyodide.loadPackage(["numpy", "scipy", "micropip"])
-
-  self.postMessage({ type: "progress", stage: "loading_python", pct: 7 });
-
-  // Install MFDFA via micropip — pinned to same version as Colab
+  // Install MFDFA
   await pyodide.runPythonAsync(`
 import micropip
 await micropip.install("MFDFA")
 import MFDFA as _mfdfa_pkg
-print("MFDFA version:", getattr(_mfdfa_pkg, "__version__", "unknown"))
 `);
-
-  self.postMessage({ type: "progress", stage: "loading_python", pct: 10 });
 
   pyReady = true;
   self.postMessage({ type: "ready" });
 }
 
-// ── Load Python source from public/python/ ───────────────────────────────────
-// In Vite dev: served at /python/*.py
-// In Vite build (GitHub Pages): served at /gait-mfdfa/python/*.py
-// We detect the base by looking at the worker's own URL.
-function getPythonBase() {
-  // self.location.href is e.g. http://localhost:5173/src/workers/mfdfa.worker.js
-  // or https://frameRateZero.github.io/gait-mfdfa/assets/mfdfa.worker-xxxx.js
-  // We want /python/ relative to the origin+base.
-  // Simplest: use import.meta.url and go up to the root.
-  // In a classic worker (importScripts), use self.location.origin +
-  // derive base from a known pattern.
-  const workerPath = self.location.pathname; // e.g. /gait-mfdfa/assets/worker.js
-  // Strip /assets/... or /src/workers/... to get the base
-  const m = workerPath.match(/^(\/[^/]*\/?)(?:assets|src)\//);
-  const base = m ? m[1] : "/";
-  return self.location.origin + base + "python/";
-}
-
-async function loadPythonSource(filename) {
-  const base = getPythonBase();
-  const url = base + filename;
-  const resp = await fetch(url, { cache: "no-store" });
-  if (!resp.ok) throw new Error(`Failed to load ${url}: ${resp.status}`);
-  return resp.text();
-}
-
-// ── Message handler ──────────────────────────────────────────────────────────
+// Message Router
 self.onmessage = async (event) => {
   const { type, payload } = event.data;
-  if (type === "run") {
+  if (type === "run_channel") {
     try {
-      await runPipeline(payload);
+      if (!pyReady) await initPyodide();
+      await computeChannel(payload);
     } catch (err) {
       self.postMessage({ type: "error", message: err.message || String(err) });
     }
   }
 };
 
-async function runPipeline({ zipBytes, metadata }) {
-  if (!pyReady) await initPyodide();
+async function computeChannel({ channelName, signalData, pipelineSrc, mfdfaSrc, analysisSrc }) {
+  self.postMessage({ type: "progress", stage: "initializing_channel", channel: channelName, pct: 15 });
 
-  // Stage: load Python modules
-  self.postMessage({ type: "progress", stage: "loading_python", pct: 11 });
-
-  const [pipelineSrc, mfdfaSrc, analysisSrc] = await Promise.all([
-    loadPythonSource("pipeline.py"),
-    loadPythonSource("mfdfa_core.py"),
-    loadPythonSource("analysis.py"),
-  ]);
-
+  // Compile individual Python runtime scripts inside this isolated heap environment
   await pyodide.runPythonAsync(pipelineSrc);
   await pyodide.runPythonAsync(mfdfaSrc);
   await pyodide.runPythonAsync(analysisSrc);
 
-  // Stage: parse zip + align
-  self.postMessage({ type: "progress", stage: "parsing_zip", pct: 12 });
+  // Bind the specific 100Hz channel slice into Pyodide memory space
+  pyodide.globals.set("_raw_signal_js", new Float64Array(signalData));
+  pyodide.globals.set("_ch_name", channelName);
 
-  pyodide.globals.set("_zip_bytes_js", new Uint8Array(zipBytes));
+  // Set up the proxy-safe progress hook callback for the 19 surrogates
+  const progressFn = (iSurr, nSurr) => {
+    const basePct = 20;
+    const availablePct = 75;
+    const pct = basePct + availablePct * (iSurr / nSurr);
+    self.postMessage({
+      type: "progress",
+      stage: "surrogates",
+      channel: channelName,
+      surrogate: iSurr,
+      n_surrogates: nSurr,
+      pct: Math.round(pct),
+    });
+  };
+  pyodide.globals.set("_js_progress_cb", progressFn);
+
   await pyodide.runPythonAsync(`
 import json as _json
-_zip_bytes_py = bytes(_zip_bytes_js.to_py())
-_aligned = load_and_align(_zip_bytes_py, target_hz=100.0, gps_accuracy_max=20.0, trim_s=60.0)
-# Don't serialise the full aligned dict yet — keep as Python object
-`);
 
-  self.postMessage({ type: "progress", stage: "tilt_corrected", pct: 14 });
+# Convert proxy array into native 1D python list
+_sig_list = _raw_signal_js.to_py()
 
-  // Stage: per-channel MFDFA
-  const CHANNELS = ["a_VT", "a_ML", "a_AP", "g_YAW", "g_ROLL", "g_PITCH"];
-  const channelResults = {};
-  const N_CH = CHANNELS.length;
-  const PCT_PER_CH = (96 - 15) / N_CH;
+# Decimate down to 50 Hz using pipeline logic
+_sig_50 = downsample_50hz(_sig_list, fs_in=100.0)
 
-  for (let ci = 0; ci < N_CH; ci++) {
-    const ch = CHANNELS[ci];
-    const basePct = 15 + ci * PCT_PER_CH;
-
-    self.postMessage({ type: "progress", stage: "mfdfa", channel: ch, pct: Math.round(basePct) });
-
-    // Set up Python-side progress callback that posts JS messages
-    pyodide.globals.set("_ch_name", ch);
-    pyodide.globals.set("_base_pct_js", basePct);
-    pyodide.globals.set("_pct_per_ch_js", PCT_PER_CH);
-
-    // Define a Python progress callback
-    // Pyodide allows calling JS from Python via pyodide.ffi
-    const progressFn = (iSurr, nSurr) => {
-      const pct = basePct + PCT_PER_CH * (iSurr / nSurr);
-      self.postMessage({
-        type: "progress",
-        stage: "surrogates",
-        channel: ch,
-        surrogate: iSurr,
-        n_surrogates: nSurr,
-        pct: Math.round(pct),
-      });
-    };
-    pyodide.globals.set("_js_progress_cb", progressFn);
-
-    await pyodide.runPythonAsync(`
-import json as _json
-
-# Reload MFDFA to clear any module-level state from previous channel
-import importlib as _il, MFDFA as _mfdfa_mod
-_il.reload(_mfdfa_mod)
-from MFDFA import MFDFA as _MFDFA_fn
-
-# Downsample channel to 50 Hz
-_sig_50 = downsample_50hz(_aligned[_ch_name], fs_in=100.0)
-
-# Wrap JS progress callback
 def _py_progress_cb(i, n):
     _js_progress_cb(i, n)
 
+# Run full MFDFA loop on clean, isolated environment heap
 _ch_result = run_channel_mfdfa(
     _sig_50,
     n_surrogates=19,
@@ -179,68 +104,18 @@ _ch_result = run_channel_mfdfa(
 _ch_result_json = _json.dumps(_ch_result)
 `);
 
-    const chJson = pyodide.globals.get("_ch_result_json");
-    const chResult = JSON.parse(chJson);
+  const jsonResult = pyodide.globals.get("_ch_result_json");
+  const chResult = JSON.parse(jsonResult);
 
-    // Add classification (mirrors Python analysis.py)
-    chResult.scalars.mf_class = classifyMF(chResult.scalars);
-    channelResults[ch] = chResult;
-
-    self.postMessage({ type: "progress", stage: "channel_done", channel: ch,
-                       pct: Math.round(basePct + PCT_PER_CH) });
-  }
-
-  // Extract aligned summary (lightweight subset for storage)
-  await pyodide.runPythonAsync(`
-_aligned_summary = {
-    "time":        _aligned["time"],
-    "a_VT":        _aligned["a_VT"],
-    "a_ML":        _aligned["a_ML"],
-    "a_AP":        _aligned["a_AP"],
-    "g_ROLL":      _aligned["g_ROLL"],
-    "g_PITCH":     _aligned["g_PITCH"],
-    "g_YAW":       _aligned["g_YAW"],
-    "a_VT_zeroed": _aligned["a_VT_zeroed"],
-    "velocity":    _aligned["velocity"],
-    "duration_s":  _aligned["duration_s"],
-    "n_samples":   _aligned["n_samples"],
-}
-_aligned_summary_json = _json.dumps(_aligned_summary)
-`);
-
-  const alignedJson = pyodide.globals.get("_aligned_summary_json");
-  const aligned = JSON.parse(alignedJson);
-
-  const sessionResult = {
-    metadata,
-    session_id:    metadata.session_id,
-    processed_at:  new Date().toISOString(),
-    channels:      channelResults,
-    aligned,
-  };
-
-  self.postMessage({ type: "result", sessionResult });
-}
-
-// ── Classification (mirrors analysis.py) ─────────────────────────────────────
-function classifyMF(row) {
-  const { robust, delta_alpha, delta_alpha_nl, p_iaaft, asymmetry } = row;
-  if (!robust) {
-    if ((asymmetry || 0) > 0.1 && (delta_alpha_nl || 0) < 0)
-      return "smoothed_constrained";
-    return "unclassified";
-  }
-  const isMF = (delta_alpha || 0) > 0.1;
-  const isNL = (delta_alpha_nl || 0) > 0.1 && (p_iaaft || 1) < 0.05;
-  if (!isMF) return "monofractal";
-  if (isNL)  return "nonlinear_multifractal";
-  return "linear_multifractal";
-}
-
-// ── Auto-init on worker load ──────────────────────────────────────────────────
-initPyodide().catch((err) => {
+  // Direct return to orchestrator
   self.postMessage({
-    type: "error",
-    message: `Pyodide init failed: ${err.message || String(err)}`,
+    type: "channel_result",
+    channelName,
+    data: chResult
   });
+}
+
+// Auto-boot environment
+initPyodide().catch((err) => {
+  self.postMessage({ type: "error", message: `Init failed: ${err.message}` });
 });
