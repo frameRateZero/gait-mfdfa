@@ -60,6 +60,8 @@ async function computeChannel({ channelName, rawDataBundle, pipelineSrc, mfdfaSr
   pyodide.globals.set("_gy_raw", new Float64Array(rawDataBundle.gy));
   pyodide.globals.set("_gz_raw", new Float64Array(rawDataBundle.gz));
   pyodide.globals.set("_ch_name", channelName);
+  pyodide.globals.set("_t_a", new Float64Array(rawDataBundle.t_a));
+  pyodide.globals.set("_t_g", new Float64Array(rawDataBundle.t_g));
 
   const progressFn = (iSurr, nSurr) => {
     const pct = Math.round(20 + 75 * (iSurr / nSurr));
@@ -75,34 +77,50 @@ async function computeChannel({ channelName, rawDataBundle, pipelineSrc, mfdfaSr
   pyodide.globals.set("_js_progress_cb", progressFn);
 
   await pyodide.runPythonAsync(`
+
 import json as _json
 import numpy as np
 
-# 1. Apply your exact X-axis geometric tilt correction definition
+_dt    = 1.0 / 100.0
+_t0    = max(float(_t_a[0]), float(_t_g[0]))
+_t1    = min(float(_t_a[-1]), float(_t_g[-1]))
+_tgrid = np.arange(_t0, _t1, _dt)
+
+_ax = np.interp(_tgrid, _t_a.to_py(), _ax_raw.to_py())
+_ay = np.interp(_tgrid, _t_a.to_py(), _ay_raw.to_py())
+_az = np.interp(_tgrid, _t_a.to_py(), _az_raw.to_py())
+_gx = np.interp(_tgrid, _t_g.to_py(), _gx_raw.to_py())
+_gy = np.interp(_tgrid, _t_g.to_py(), _gy_raw.to_py())
+_gz = np.interp(_tgrid, _t_g.to_py(), _gz_raw.to_py())
+
+_trim_n = int(60.0 * 100.0)
+_ax = _ax[_trim_n:-_trim_n]
+_ay = _ay[_trim_n:-_trim_n]
+_az = _az[_trim_n:-_trim_n]
+_gx = _gx[_trim_n:-_trim_n]
+_gy = _gy[_trim_n:-_trim_n]
+_gz = _gz[_trim_n:-_trim_n]
+
 _aligned = correct_tilt_horizontal(
-    _ax_raw.to_py(), _ay_raw.to_py(), _az_raw.to_py(),
-    _gx_raw.to_py(), _gy_raw.to_py(), _gz_raw.to_py(),
-    fs=100.0
+    _ax, _ay, _az, _gx, _gy, _gz, fs=100.0
 )
 
-# Extract our target tracking signal
 _signal_100 = _aligned[_ch_name]
 
-# 2. Downsample target signal from 100Hz to 50Hz to preserve microstructures
-#_signal_50 = downsample_50hz(_signal_100.tolist(), fs_in=100.0)
-
-# 3. Run MFDFA execution loop
 _ch_result = run_channel_mfdfa(
-    _signal_100, #50
+    _signal_100.tolist(),
     n_surrogates=19,
     base_seed=42,
-    fs=50.0,
+    fs=100.0,
     order=2,
     n_lags=80,
     scale_min_s=0.3,
     scale_max_s=30.0,
     progress_cb=lambda i, n: _js_progress_cb(i, n),
 )
+
+_ch_result["aligned_slice"] = _signal_100.tolist()[:2000]
+_ch_result_json = _json.dumps(_ch_result)
 
 # Bundle geometric curves for the main dashboard UI
 _ch_result["aligned_slice"] = _signal_100.tolist()[:2000] # return first 20s segment for line rendering
