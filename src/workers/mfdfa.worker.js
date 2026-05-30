@@ -153,6 +153,11 @@ _aligned = load_and_align(_zip_bytes_py, target_hz=100.0, gps_accuracy_max=20.0,
     await pyodide.runPythonAsync(`
 import json as _json
 
+# Reload MFDFA to clear any module-level state from previous channel
+import importlib as _il, MFDFA as _mfdfa_mod
+_il.reload(_mfdfa_mod)
+from MFDFA import MFDFA as _MFDFA_fn
+
 # Downsample channel to 50 Hz
 _sig_50 = downsample_50hz(_aligned[_ch_name], fs_in=100.0)
 
