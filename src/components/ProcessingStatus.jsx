@@ -20,6 +20,7 @@ const STAGE_LABELS = {
   mfdfa:          "Running MFDFA",
   surrogates:     "Running IAAFT surrogates",
   channel_done:   "Channel complete",
+  loading_modules: "Loading analysis modules…",
 };
 
 export default function ProcessingStatus({ progress }) {
