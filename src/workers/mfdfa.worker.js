@@ -89,11 +89,11 @@ _aligned = correct_tilt_horizontal(
 _signal_100 = _aligned[_ch_name]
 
 # 2. Downsample target signal from 100Hz to 50Hz to preserve microstructures
-_signal_50 = downsample_50hz(_signal_100.tolist(), fs_in=100.0)
+#_signal_50 = downsample_50hz(_signal_100.tolist(), fs_in=100.0)
 
 # 3. Run MFDFA execution loop
 _ch_result = run_channel_mfdfa(
-    _signal_50,
+    _signal_100, #50
     n_surrogates=19,
     base_seed=42,
     fs=50.0,
