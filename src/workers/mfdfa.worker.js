@@ -107,11 +107,14 @@ _aligned = correct_tilt_horizontal(
 
 _signal_100 = _aligned[_ch_name]
 
+# Downsample to 50Hz — MFDFA was validated at 50Hz in Colab
+_signal_50 = downsample_50hz(_signal_100.tolist(), fs_in=100.0)
+
 _ch_result = run_channel_mfdfa(
-    _signal_100.tolist(),
+    _signal_50,
     n_surrogates=19,
     base_seed=42,
-    fs=100.0,
+    fs=50.0,
     order=2,
     n_lags=80,
     scale_min_s=0.3,
