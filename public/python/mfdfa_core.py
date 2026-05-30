@@ -117,17 +117,9 @@ def compute_multifractal_spectrum(
     # ── Legendre transform ────────────────────────────────────────────────
     tau_q = q.copy() * H_q.copy() - 1.0
 
-    # np.gradient with non-uniform spacing uses a 3-point stencil that
-    # produces a large error at the q=0 gap (-0.5 → +0.5 step = 1.0 vs
-    # the uniform ~0.31 step elsewhere).  Split negative/positive q,
-    # compute gradient on each contiguous segment, then concatenate.
-    neg_mask = q < 0
-    pos_mask = q > 0
-    alpha = np.full_like(tau_q, np.nan)
-    if neg_mask.sum() >= 2:
-        alpha[neg_mask] = np.gradient(tau_q[neg_mask].copy(), q[neg_mask].copy())
-    if pos_mask.sum() >= 2:
-        alpha[pos_mask] = np.gradient(tau_q[pos_mask].copy(), q[pos_mask].copy())
+    # Let np.gradient handle the entire monotonic q-array globally. 
+    # It natively and correctly accounts for the non-uniform step crossing the q=0 gap.
+    alpha = np.gradient(tau_q.copy(), q.copy())
 
     f_alpha = q.copy() * alpha.copy() - tau_q.copy()
 
