@@ -2,6 +2,7 @@
   "name": "gait-mfdfa",
   "version": "1.0.0",
   "description": "",
+  "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -11,11 +12,14 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@vitejs/plugin-react": "^4.7.0",
+    "jszip": "^3.10.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-is": "^19.2.6",
     "recharts": "^3.8.1",
     "vite": "^4.5.14"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.7.0"
   }
 }
